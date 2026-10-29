@@ -1,0 +1,654 @@
+name: Cloud Server Runner (RDP and VPS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: 'Server OS (Windows or Linux Distros)'
+        required: false
+        default: 'windows-2022'
+      ram_size:
+        description: 'RAM Configuration'
+        required: false
+        default: '16GB'
+      ngrok_token:
+        description: 'Ngrok Auth Token'
+        required: false
+        default: ''
+      ngrok_region:
+        description: 'Ngrok Region'
+        required: false
+        default: 'eu'
+
+jobs:
+  rdp-setup:
+    if: "startsWith(inputs.windows_version, 'windows') || startsWith(inputs.windows_version, 'win') || inputs.windows_version == ''"
+    runs-on: ${{ (inputs.windows_version == 'windows-2025' || inputs.windows_version == 'win2025-ai') && 'windows-2025' || 'windows-2022' }}
+    timeout-minutes: 360 # 6 hours max runtime
+    steps:
+      - name: Download and extract Ngrok v3
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath .
+          Remove-Item ngrok.zip
+          Copy-Item .\ngrok.exe C:\Windows\System32\ngrok.exe -Force
+
+      - name: Optimize Disk and Configure RAM
+        shell: pwsh
+        run: |
+          $ramChoice = "${{ inputs.ram_size }}"
+          Write-Output "[*] Target RAM Configuration: $ramChoice"
+          
+          if ($ramChoice -eq "32GB" -or $ramChoice -eq "64GB") {
+            $pageMB = if ($ramChoice -eq "64GB") { 57344 } else { 24576 }
+            try {
+              Set-CimInstance -Query "Select * from Win32_ComputerSystem" -Property @{AutomaticManagedPagefile = $false} -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'PagingFiles' -Value @("C:\pagefile.sys $pageMB $pageMB") -ErrorAction SilentlyContinue
+              Write-Output "[+] Virtual memory pagefile configured for $pageMB MB"
+            } catch {}
+          }
+          
+          Start-Job { Remove-Item -Recurse -Force "C:\hostedtoolcache" -ErrorAction SilentlyContinue } | Out-Null
+          $freeGB = [Math]::Round((Get-PSDrive C).Free / 1GB, 1)
+          Write-Output "[+] Free SSD Space on C:: $freeGB GB"
+
+      - name: Enable RDP and Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 1 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fPromptForPassword" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "PortNumber" -Value 3389 -Force
+          
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "fDisableUDP" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -Value 2 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters" -Name "BlockNTLM" -Value 0 -Force -ErrorAction SilentlyContinue
+          
+          Set-Service -Name "TermService" -StartupType Automatic
+          Restart-Service -Name "TermService" -Force
+          
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="Allow-RDP" dir=in action=allow protocol=TCP localport=3389
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-3389" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue
+
+          $ready = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            $test = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) {
+              Write-Output "[+] TermService is listening on 127.0.0.1:3389!"
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) {
+            Restart-Service -Name "TermService" -Force
+            Start-Sleep -Seconds 2
+          }
+
+      - name: Create Admin User
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\secpol.cfg
+          (Get-Content C:\secpol.cfg).replace("PasswordComplexity = 1", "PasswordComplexity = 0").replace("MinimumPasswordLength = 8", "MinimumPasswordLength = 0") | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item -Force C:\secpol.cfg -ErrorAction SilentlyContinue
+
+          cmd.exe /c "net user Fazah Fazah@123 /add /expires:never /active:yes"
+          cmd.exe /c "net localgroup Administrators Fazah /add"
+          cmd.exe /c "net localgroup `"Remote Desktop Users`" Fazah /add"
+          cmd.exe /c "net user runneradmin Fazah@123 /active:yes"
+
+      - name: Configure and Start Ngrok Tunnel
+        id: ngrok-tunnel
+        shell: pwsh
+        env:
+          DEFAULT_NGROK: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          $tok = "${{ inputs.ngrok_token }}"
+          if (-not $tok) { $tok = $env:DEFAULT_NGROK }
+          $reg = "${{ inputs.ngrok_region }}"
+          if (-not $reg -or $reg -eq "gb") { $reg = "eu" }
+
+          @(
+            'version: "2"',
+            "authtoken: $tok",
+            "region: $reg",
+            'tunnels:',
+            '  rdp:',
+            '    proto: tcp',
+            '    addr: 127.0.0.1:3389'
+          ) | Out-File -FilePath "C:\ngrok.yml" -Encoding ascii
+
+          Write-Output "[*] Installing Ngrok Windows Service..."
+          C:\Windows\System32\ngrok.exe service install --config="C:\ngrok.yml"
+          C:\Windows\System32\ngrok.exe service start
+
+          $tunnelUrl = $null
+          $timeout = 30
+          while ($timeout -gt 0 -and -not $tunnelUrl) {
+            Start-Sleep -Seconds 2
+            try {
+              $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              $tcp = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+              if ($tcp) {
+                $tunnelUrl = $tcp.public_url -replace "^tcp://", ""
+              }
+            } catch {}
+            $timeout--
+          }
+
+          if ($tunnelUrl) {
+            Write-Output "[+] RDP Public Address: $tunnelUrl"
+            echo "tunnel_url=$tunnelUrl" >> $env:GITHUB_OUTPUT
+            echo "TUNNEL_HOST=$tunnelUrl" >> $env:GITHUB_ENV
+          } else {
+            Write-Output "[!] Failed to get tunnel URL within timeout."
+            exit 1
+          }
+
+      - name: Build and Upload .rdp Artifact
+        shell: pwsh
+        run: |
+          @(
+            "full address:s:${{ env.TUNNEL_HOST }}",
+            "username:s:Fazah",
+            "prompt for credentials:i:1",
+            "administrative session:i:1",
+            "authentication level:i:0",
+            "enablecredsspsupport:i:0",
+            "autoreconnection enabled:i:1",
+            "smart sizing:i:1",
+            "screen mode id:i:2",
+            "desktopwidth:i:1920",
+            "desktopheight:i:1080",
+            "redirectclipboard:i:1"
+          ) | Out-File -FilePath rdp-connection.rdp -Encoding ascii
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection
+          path: rdp-connection.rdp
+          retention-days: 1
+
+      - name: Install OpenCode AI and REA Tools (Windows)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Output "[*] Setting up Integrated AI Environment (OpenCode + REA with Full Arabic Support)..."
+          try {
+            npm install -g opencode-ai @opencode/cli rea-agents --force
+            $npmPrefix = (npm config get prefix).Trim()
+            $curPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if ($curPath -notlike "*$npmPrefix*") {
+              [Environment]::SetEnvironmentVariable("Path", "$curPath;$npmPrefix", "Machine")
+            }
+          } catch {
+            Write-Output "[!] NPM install warning: $_"
+          }
+          try {
+            # 1. Configure System Console for Full UTF-8 & Arabic Rendering
+            reg add "HKCU\Console" /v CodePage /t REG_DWORD /d 65001 /f | Out-Null
+            reg add "HKCU\Console" /v VirtualTerminalLevel /t REG_DWORD /d 1 /f | Out-Null
+            reg add "HKCU\Console" /v FaceName /t REG_SZ /d "Consolas" /f | Out-Null
+            
+            # 2. Add Arabic (101) Keyboard Layout with Alt+Shift toggle for Fazah and all users
+            $regPreload = "HKCU:\Keyboard Layout\Preload"
+            if (-not (Test-Path $regPreload)) { New-Item -Path $regPreload -Force | Out-Null }
+            Set-ItemProperty -Path $regPreload -Name "1" -Value "00000409" -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $regPreload -Name "2" -Value "00000401" -ErrorAction SilentlyContinue
+            
+            New-Item -Path "Registry::HKEY_USERS\.DEFAULT\Keyboard Layout\Preload" -Force -ErrorAction SilentlyContinue | Out-Null
+            Set-ItemProperty -Path "Registry::HKEY_USERS\.DEFAULT\Keyboard Layout\Preload" -Name "1" -Value "00000409" -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path "Registry::HKEY_USERS\.DEFAULT\Keyboard Layout\Preload" -Name "2" -Value "00000401" -ErrorAction SilentlyContinue
+            
+            # 3. Create Arabic Language Rules & AGENTS.md for Seamless Connected Arabic
+            $arabicRules = @(
+              '# تعليمات اللغة العربية',
+              '- التحدث والكتابة دائما باللغة العربية الفصحى السليمة والمترابطة بشكل طبيعي.',
+              '- اكتب الكلمات دائما متصلة الحروف ككتلة واحدة مثل الكتابة في الكتب والمواقع الرسمية (مثال: مرحباً بك، أهلاً وسهلاً، كيف يمكنني مساعدتك؟).',
+              '- يمنع منعا باتا وضع مسافات بين حروف الكلمة الواحدة.',
+              '- يمنع منعا باتا عكس اتجاه الحروف أو الكلمات إطلاقا.',
+              '- حافظ على الكلمات الإنجليزية والبرمجية وأسماء الدوال كما هي بالإنجليزية مع شرحها بالعربية المتصلة السليمة.'
+            ) -join "`r`n"
+            
+            $cfg = @{
+              "`$schema" = "https://opencode.ai/config.json"
+              instructions = @(
+                "C:\Users\Public\.config\opencode\arabic_rules.md"
+              )
+              mcp = @{
+                rea = @{
+                  type = "local"
+                  command = @("npx", "-y", "rea-agents", "mcp")
+                  enabled = $true
+                }
+              }
+            } | ConvertTo-Json -Depth 5
+            
+            $targetDirs = @(
+              "C:\Users\Public\.config\opencode",
+              "C:\Users\Fazah\.config\opencode",
+              "C:\Users\Fazah\AppData\Roaming\opencode",
+              "C:\Users\Fazah",
+              "C:\Users\runneradmin\.config\opencode",
+              "C:\Users\runneradmin\AppData\Roaming\opencode",
+              "C:\Users\runneradmin",
+              "C:\Users\Default\.config\opencode"
+            )
+            foreach ($d in $targetDirs) {
+              if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+              Set-Content -Path "$d\opencode.json" -Value $cfg -Encoding UTF8
+              Set-Content -Path "$d\arabic_rules.md" -Value $arabicRules -Encoding UTF8
+              Set-Content -Path "$d\AGENTS.md" -Value $arabicRules -Encoding UTF8
+            }
+            
+            # 4. Clean Launchers: Web Edition (Full Arabic RTL in Edge) + Terminal Edition + REA
+            $openCodeWebBat = @(
+              '@echo off',
+              'chcp 65001 >nul',
+              'set PYTHONIOENCODING=utf-8',
+              'set LANG=en_US.UTF-8',
+              'title OpenCode AI - Arabic Web UI',
+              'color 0A',
+              'echo =======================================================================',
+              'echo   [+] OpenCode AI - Full Arabic Web UI (Edge / Chrome Browser)',
+              'echo   [+] Native RTL + Full Connected Arabic Script (بدون اي تشقلب)',
+              'echo   [+] Opening browser at http://127.0.0.1:4096 ...',
+              'echo =======================================================================',
+              'echo.',
+              'cd /d "%USERPROFILE%"',
+              'start "" http://127.0.0.1:4096',
+              'where opencode >nul 2>nul',
+              'if %errorlevel% equ 0 (',
+              '  call opencode web --port 4096 --hostname 127.0.0.1',
+              ') else (',
+              '  call npx -y @opencode/cli web --port 4096 --hostname 127.0.0.1',
+              ')',
+              'pause'
+            )
+            $openCodeBat = @(
+              '@echo off',
+              'chcp 65001 >nul',
+              'set PYTHONIOENCODING=utf-8',
+              'set LANG=en_US.UTF-8',
+              'title OpenCode AI Terminal',
+              'color 0A',
+              'echo =======================================================================',
+              'echo   [+] OpenCode AI Agent + REA Reverse Engineering MCP',
+              'echo   [+] Terminal UTF-8 Mode (For 100%% Arabic RTL, use OpenCode Web)',
+              'echo   [+] Official Website: https://opencode.ai/ar',
+              'echo =======================================================================',
+              'echo.',
+              'cd /d "%USERPROFILE%"',
+              'where opencode >nul 2>nul',
+              'if %errorlevel% equ 0 (',
+              '  call opencode',
+              ') else (',
+              '  call npx -y @opencode/cli',
+              ')',
+              'pause'
+            )
+            $reaBat = @(
+              '@echo off',
+              'chcp 65001 >nul',
+              'set PYTHONIOENCODING=utf-8',
+              'set LANG=en_US.UTF-8',
+              'title REA Reverse Engineering Agent',
+              'color 0B',
+              'echo =======================================================================',
+              'echo   [+] REA - Reverse Engineer Anything (MCP Engine)',
+              'echo   [+] Full Arabic and UTF-8 Support (Alt+Shift for Arabic)',
+              'echo =======================================================================',
+              'echo.',
+              'cd /d "%USERPROFILE%"',
+              'where rea-agents >nul 2>nul',
+              'if %errorlevel% equ 0 (',
+              '  call rea-agents',
+              ') else (',
+              '  call npx -y rea-agents',
+              ')',
+              'pause'
+            )
+            $urlContent = "[InternetShortcut]`r`nURL=https://opencode.ai/ar`r`nIconIndex=0`r`n"
+            $urlWebLocal = "[InternetShortcut]`r`nURL=http://127.0.0.1:4096`r`nIconIndex=0`r`n"
+            $allDesktops = @(
+              "C:\Users\Public\Desktop",
+              "C:\Users\Fazah\Desktop",
+              "C:\Users\runneradmin\Desktop",
+              "C:\Users\Default\Desktop"
+            )
+            foreach ($dp in $allDesktops) {
+              if (-not (Test-Path $dp)) { New-Item -ItemType Directory -Path $dp -Force | Out-Null }
+              Set-Content -Path "$dp\OpenCode Web (المتصفح العربي).bat" -Value $openCodeWebBat -Encoding UTF8
+              Set-Content -Path "$dp\OpenCode AI (الطرفية).bat" -Value $openCodeBat -Encoding UTF8
+              Set-Content -Path "$dp\REA Agent.bat" -Value $reaBat -Encoding UTF8
+              Set-Content -Path "$dp\OpenCode Web Local.url" -Value $urlWebLocal -Encoding ASCII
+              Set-Content -Path "$dp\OpenCode Official.url" -Value $urlContent -Encoding ASCII
+            }
+            Write-Output "[+] OpenCode AI (Web Arabic + Terminal) shortcuts created on all desktop profiles!"
+          } catch {
+            Write-Output "[!] Desktop shortcuts note: $_"
+          }
+
+      - name: Keep Alive Session
+        shell: pwsh
+        env:
+          TUNNEL_HOST: ${{ steps.ngrok-tunnel.outputs.tunnel_url }}
+        run: |
+          Write-Output "[+] RDP is now live ($env:TUNNEL_HOST)! Keeping runner alive..."
+          while ($true) {
+            $svc = Get-Service -Name "ngrok" -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Running") {
+              Write-Output "[!] Ngrok service stopped. Restarting service..."
+              Start-Service -Name "ngrok" -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds 120
+          }
+
+      - name: Cleanup Ngrok
+        if: always()
+        shell: pwsh
+        run: |
+          try { C:\Windows\System32\ngrok.exe service stop } catch {}
+          try { C:\Windows\System32\ngrok.exe service uninstall } catch {}
+
+  vps-setup:
+    if: "!startsWith(inputs.windows_version, 'windows') && !startsWith(inputs.windows_version, 'win') && !startsWith(inputs.windows_version, 'mac') && inputs.windows_version != ''"
+    runs-on: ${{ (inputs.windows_version == 'ubuntu-24.04' || inputs.windows_version == 'ubuntu24-ai' || inputs.windows_version == 'ubuntu24-gui-ai') && 'ubuntu-24.04' || ((inputs.windows_version == 'ubuntu-22.04' || inputs.windows_version == 'ubuntu22-ai' || inputs.windows_version == 'ubuntu22-gui-ai') && 'ubuntu-22.04' || 'ubuntu-latest') }}
+    timeout-minutes: 360 # 6 hours max runtime
+    steps:
+      - name: Optimize Disk and Configure RAM Swap
+        run: |
+          ramChoice="${{ inputs.ram_size }}"
+          echo "[*] Target VPS RAM: $ramChoice"
+          sudo rm -rf /opt/hostedtoolcache &
+          if [ "$ramChoice" = "32GB" ] || [ "$ramChoice" = "64GB" ] || [ "$ramChoice" = "16GB" ]; then
+            swapGB=8
+            if [ "$ramChoice" = "32GB" ]; then swapGB=24; fi
+            if [ "$ramChoice" = "64GB" ]; then swapGB=56; fi
+            echo "[*] Configuring ${swapGB}GB swap space..."
+            sudo swapoff -a || true
+            sudo rm -f /swapfile || true
+            if sudo fallocate -l ${swapGB}G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=$((swapGB * 1024)) 2>/dev/null; then
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile || true
+              echo "[+] Swap configured successfully!"
+            fi
+          fi
+          free -h
+
+      - name: Install and Extract Ngrok v3
+        run: |
+          curl -s https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar -C /usr/local/bin -xz
+          sudo chmod +x /usr/local/bin/ngrok
+          tok="${{ inputs.ngrok_token }}"
+          if [ -z "$tok" ]; then tok="${{ secrets.NGROK_AUTH_TOKEN }}"; fi
+          ngrok config add-authtoken "$tok"
+
+      - name: Setup GUI Desktop and XRDP
+        if: "endsWith(inputs.windows_version, '-gui') || endsWith(inputs.windows_version, '-gui-ai') || inputs.windows_version == 'android-cloud' || inputs.windows_version == 'ai-dev'"
+        run: |
+          TARGET_OS="${{ inputs.windows_version }}"
+          echo "[+] Installing XFCE Desktop & XRDP with Xorg driver for $TARGET_OS..."
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal xrdp xorgxrdp dbus-x11 x11-xserver-utils python3-tk curl wget nano
+          
+          echo "runner:Fazah@123" | sudo chpasswd
+          echo "root:Fazah@123" | sudo chpasswd
+          sudo adduser xrdp ssl-cert
+          sudo adduser runner ssl-cert
+          
+          # Prevent Polkit Color Manager authorization crash in headless session
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
+          cat << 'EOF' | sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          [Allow Colord all Users]
+          Identity=unix-user:*
+          Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
+          ResultAny=no
+          ResultInactive=no
+          ResultActive=yes
+          EOF
+          
+          # Clean Xsession
+          echo "startxfce4" > /home/runner/.xsession
+          chmod +x /home/runner/.xsession
+          sudo chown runner:runner /home/runner/.xsession
+          
+          # Overwrite /etc/xrdp/startwm.sh to guarantee clean DBus session and prevent session crash
+          cat << 'EOF' | sudo tee /etc/xrdp/startwm.sh > /dev/null
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
+          fi
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod +x /etc/xrdp/startwm.sh
+          
+          # Configure auto-login in XRDP for runner so user connects directly without grey login window!
+          sudo sed -i '/^\[Xorg\]/,/^\[/ s/^username=.*/username=runner/' /etc/xrdp/xrdp.ini
+          sudo sed -i '/^\[Xorg\]/,/^\[/ s/^password=.*/password=Fazah@123/' /etc/xrdp/xrdp.ini
+
+      - name: Setup GUI Custom Themes and Apps
+        if: "endsWith(inputs.windows_version, '-gui') || endsWith(inputs.windows_version, '-gui-ai')"
+        run: |
+          echo "aW1wb3J0IG9zLCBzeXMsIHNodXRpbCwgdXJsbGliLnJlcXVlc3QKCmJnX2ZpbGUgPSAnL3Vzci9zaGFyZS9iYWNrZ3JvdW5kcy9kZXNrdG9wLWJnLnBuZycKb3MubWFrZWRpcnMoJy91c3Ivc2hhcmUvYmFja2dyb3VuZHMnLCBleGlzdF9vaz1UcnVlKQoKdXJsID0gJ2h0dHBzOi8vcmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbS9vd2VyZG9nYW4vd2FsbHBhcGVycy1mb3Ita2FsaS9tYWluL2thbGktY3lhbi9jeWFuLWthbGktbmVvbi0xNng5LnBuZycKdHJ5OgogICAgcmVxID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCh1cmwsIGhlYWRlcnM9eydVc2VyLUFnZW50JzogJ01vemlsbGEvNS4wJ30pCiAgICB3aXRoIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PTEyKSBhcyByZXNwLCBvcGVuKGJnX2ZpbGUsICd3YicpIGFzIG91dDoKICAgICAgICBvdXQud3JpdGUocmVzcC5yZWFkKCkpCmV4Y2VwdCBFeGNlcHRpb246CiAgICBwYXNzCgpmb3IgZCBpbiBbJy91c3Ivc2hhcmUvYmFja2dyb3VuZHMveGZjZScsICcvdXNyL3NoYXJlL2ltYWdlcy9kZXNrdG9wLWJhc2UnXToKICAgIG9zLm1ha2VkaXJzKGQsIGV4aXN0X29rPVRydWUpCmZvciBmYiBpbiBbJy91c3Ivc2hhcmUvYmFja2dyb3VuZHMveGZjZS94ZmNlLWJsdWUuanBnJywgJy91c3Ivc2hhcmUvYmFja2dyb3VuZHMveGZjZS94ZmNlLXRlYWwuanBnJywgJy91c3Ivc2hhcmUvaW1hZ2VzL2Rlc2t0b3AtYmFzZS9kZWZhdWx0J106CiAgICB0cnk6IHNodXRpbC5jb3B5ZmlsZShiZ19maWxlLCBmYikKICAgIGV4Y2VwdDogcGFzcwoKeG1sID0gJycnPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPGNoYW5uZWwgbmFtZT0ieGZjZTQtZGVza3RvcCIgdmVyc2lvbj0iMS4wIj4KICA8cHJvcGVydHkgbmFtZT0iYmFja2Ryb3AiIHR5cGU9ImVtcHR5Ij4KICAgIDxwcm9wZXJ0eSBuYW1lPSJzY3JlZW4wIiB0eXBlPSJlbXB0eSI+CiAgICAgIDxwcm9wZXJ0eSBuYW1lPSJtb25pdG9yMCIgdHlwZT0iZW1wdHkiPjxwcm9wZXJ0eSBuYW1lPSJ3b3Jrc3BhY2UwIiB0eXBlPSJlbXB0eSI+PHByb3BlcnR5IG5hbWU9ImltYWdlLXN0eWxlIiB0eXBlPSJpbnQiIHZhbHVlPSI1Ii8+PHByb3BlcnR5IG5hbWU9Imxhc3QtaW1hZ2UiIHR5cGU9InN0cmluZyIgdmFsdWU9Ii91c3Ivc2hhcmUvYmFja2dyb3VuZHMvZGVza3RvcC1iZy5wbmciLz48L3Byb3BlcnR5PjwvcHJvcGVydHk+CiAgICAgIDxwcm9wZXJ0eSBuYW1lPSJtb25pdG9yMSIgdHlwZT0iZW1wdHkiPjxwcm9wZXJ0eSBuYW1lPSJ3b3Jrc3BhY2UwIiB0eXBlPSJlbXB0eSI+PHByb3BlcnR5IG5hbWU9ImltYWdlLXN0eWxlIiB0eXBlPSJpbnQiIHZhbHVlPSI1Ii8+PHByb3BlcnR5IG5hbWU9Imxhc3QtaW1hZ2UiIHR5cGU9InN0cmluZyIgdmFsdWU9Ii91c3Ivc2hhcmUvYmFja2dyb3VuZHMvZGVza3RvcC1iZy5wbmciLz48L3Byb3BlcnR5PjwvcHJvcGVydHk+CiAgICAgIDxwcm9wZXJ0eSBuYW1lPSJtb25pdG9ycmRwMCIgdHlwZT0iZW1wdHkiPjxwcm9wZXJ0eSBuYW1lPSJ3b3Jrc3BhY2UwIiB0eXBlPSJlbXB0eSI+PHByb3BlcnR5IG5hbWU9ImltYWdlLXN0eWxlIiB0eXBlPSJpbnQiIHZhbHVlPSI1Ii8+PHByb3BlcnR5IG5hbWU9Imxhc3QtaW1hZ2UiIHR5cGU9InN0cmluZyIgdmFsdWU9Ii91c3Ivc2hhcmUvYmFja2dyb3VuZHMvZGVza3RvcC1iZy5wbmciLz48L3Byb3BlcnR5PjwvcHJvcGVydHk+CiAgICA8L3Byb3BlcnR5PgogIDwvcHJvcGVydHk+CjwvY2hhbm5lbD4nJycKCmZvciB4ZCBpbiBbJy9ldGMveGRnL3hmY2U0L3hmY29uZi94ZmNlLXBlcmNoYW5uZWwteG1sJywgJy9ob21lL3J1bm5lci8uY29uZmlnL3hmY2U0L3hmY29uZi94ZmNlLXBlcmNoYW5uZWwteG1sJ106CiAgICBvcy5tYWtlZGlycyh4ZCwgZXhpc3Rfb2s9VHJ1ZSkKICAgIHdpdGggb3Blbihvcy5wYXRoLmpvaW4oeGQsICd4ZmNlNC1kZXNrdG9wLnhtbCcpLCAndycpIGFzIGY6CiAgICAgICAgZi53cml0ZSh4bWwpCgpkZCA9ICcvaG9tZS9ydW5uZXIvRGVza3RvcCcKb3MubWFrZWRpcnMoZGQsIGV4aXN0X29rPVRydWUpCmRlZiBhZGRfaWNvbihmbiwgbmFtZSwgY21kLCBpY29uKToKICAgIHAgPSBvcy5wYXRoLmpvaW4oZGQsIGZuKQogICAgd2l0aCBvcGVuKHAsICd3JykgYXMgZjoKICAgICAgICBmLndyaXRlKGYnW0Rlc2t0b3AgRW50cnldXG5WZXJzaW9uPTEuMFxuVHlwZT1BcHBsaWNhdGlvblxuTmFtZT17bmFtZX1cbkV4ZWM9e2NtZH1cbkljb249e2ljb259XG5UZXJtaW5hbD1mYWxzZVxuJykKICAgIG9zLmNobW9kKHAsIDBvNzU1KQoKYWRkX2ljb24oJzAxLWthbGktdGVybS5kZXNrdG9wJywgJ/CfkIkgS2FsaSBSb290IFRlcm1pbmFsJywgJ3hmY2U0LXRlcm1pbmFsIC0tdGl0bGU9IvCfkIkgS2FsaSBUZXJtaW5hbCAoUm9vdCkiJywgJ3V0aWxpdGllcy10ZXJtaW5hbCcpCmFkZF9pY29uKCcwMi1ubWFwLmRlc2t0b3AnLCAn4pqU77iPIE5tYXAgTmV0d29yayBTY2FubmVyJywgJ3hmY2U0LXRlcm1pbmFsIC1lICJiYXNoIC1jIFwnbm1hcCAtLWhlbHAgfCBoZWFkIC1uIDMwOyBleGVjIGJhc2hcJyInLCAnbmV0d29yay13aXJlZCcpCmFkZF9pY29uKCcwMy13aXJlc2hhcmsuZGVza3RvcCcsICfwn6aIIFdpcmVzaGFyayBBbmFseXplcicsICd3aXJlc2hhcmsnLCAnYXBwbGljYXRpb25zLWludGVybmV0JykKYWRkX2ljb24oJzA0LXNxbG1hcC5kZXNrdG9wJywgJ/CfkokgU1FMTWFwIERhdGFiYXNlIFRvb2wnLCAneGZjZTQtdGVybWluYWwgLWUgImJhc2ggLWMgXCdzcWxtYXAgLS12ZXJzaW9uOyBleGVjIGJhc2hcJyInLCAndXRpbGl0aWVzLXRlcm1pbmFsJykKYWRkX2ljb24oJzA1LWpvaG4uZGVza3RvcCcsICfwn5SRIEpvaG4gVGhlIFJpcHBlcicsICd4ZmNlNC10ZXJtaW5hbCAtZSAiYmFzaCAtYyBcJ2pvaG47IGV4ZWMgYmFzaFwnIicsICd1dGlsaXRpZXMtdGVybWluYWwnKQphZGRfaWNvbignMDYtaHlkcmEuZGVza3RvcCcsICfimqEgVEhDIEh5ZHJhIEJydXRlcicsICd4ZmNlNC10ZXJtaW5hbCAtZSAiYmFzaCAtYyBcJ2h5ZHJhIC1oIHwgaGVhZCAtbiAyNTsgZXhlYyBiYXNoXCciJywgJ3V0aWxpdGllcy10ZXJtaW5hbCcpCmFkZF9pY29uKCcwNy1haXJjcmFjay5kZXNrdG9wJywgJ/Cfk6EgQWlyY3JhY2stbmcgV2lGaScsICd4ZmNlNC10ZXJtaW5hbCAtZSAiYmFzaCAtYyBcJ2FpcmNyYWNrLW5nIC0taGVscCB8IGhlYWQgLW4gMjU7IGV4ZWMgYmFzaFwnIicsICduZXR3b3JrLXdpcmVsZXNzJykKYWRkX2ljb24oJzA4LW5pa3RvLmRlc2t0b3AnLCAn8J+UjSBOaWt0byBXZWIgU2Nhbm5lcicsICd4ZmNlNC10ZXJtaW5hbCAtZSAiYmFzaCAtYyBcJ25pa3RvIC1IOyBleGVjIGJhc2hcJyInLCAnbmV0d29yay13aXJlZCcpCmFkZF9pY29uKCcwOS1nb2J1c3Rlci5kZXNrdG9wJywgJ/CfmoAgR29idXN0ZXIgRGlyZWN0b3J5JywgJ3hmY2U0LXRlcm1pbmFsIC1lICJiYXNoIC1jIFwnZ29idXN0ZXIgLWggfCBoZWFkIC1uIDI1OyBleGVjIGJhc2hcJyInLCAndXRpbGl0aWVzLXRlcm1pbmFsJykKYWRkX2ljb24oJzEwLXdvcmRsaXN0cy5kZXNrdG9wJywgJ/Cfk4EgU2VjTGlzdHMgJiBXb3JkbGlzdHMnLCAndGh1bmFyIC91c3Ivc2hhcmUvd29yZGxpc3RzJywgJ3N5c3RlbS1maWxlLW1hbmFnZXInKQphZGRfaWNvbignMTEtYnJvd3Nlci5kZXNrdG9wJywgJ/CfjJAgQ3liZXIgQnJvd3NlcicsICd4LXd3dy1icm93c2VyJywgJ3dlYi1icm93c2VyJykK" | base64 -d | python3 || true
+
+          echo "[*] Installing Complete Official Kali Offensive Suite..."
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            nmap wireshark tshark aircrack-ng hydra john sqlmap netcat-traditional \
+            nikto dirb gobuster wfuzz hashcat tcpdump binwalk foremost testdisk steghide radare2 gdb || true
+          sudo mkdir -p /usr/share/wordlists
+          curl -sSL "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" -o /usr/share/wordlists/rockyou.txt 2>/dev/null || true
+
+          mkdir -p /home/runner/.config/autostart
+          echo "IyEvYmluL2Jhc2gKY2xlYXIKZWNobyAiPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSIKZWNobyAiICDwn5CJIEtBTEkgTElOVVggT0ZGSUNJQUwgT0ZGRU5TSVZFIFNVSVRFIChST09UIC8gUlVOTkVSKSIKZWNobyAiPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSIKZWNobyAiICBbK10gT3BlcmF0aW5nIFN5c3RlbSA6IEthbGkgTGludXggU2VjdXJpdHkgRGVza3RvcCAoNjQtYml0KSIKZWNobyAiICBbK10gVXNlciBQcml2aWxlZ2VzICA6IHJ1bm5lciAoc3VkbyAvIHJvb3QgYWNjZXNzKSIKZWNobyAiICBbK10gUGFzc3dvcmQgICAgICAgICA6IEZhemFoQDEyMyIKZWNobyAiICBbK10gRGVza3RvcCBUaGVtZSAgICA6IEF1dGhlbnRpYyBHbG93aW5nIEthbGkgRHJhZ29uIFdhbGxwYXBlciIKZWNobyAiICBbK10gV29yZGxpc3RzICAgICAgICA6IC91c3Ivc2hhcmUvd29yZGxpc3RzL3JvY2t5b3UudHh0IgplY2hvICItLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIgplY2hvICIgIFvimpTvuI9dIFByZWluc3RhbGxlZCAmIFJlYWR5IE9mZmVuc2l2ZSBTZWN1cml0eSBBcnNlbmFsOiIKZWNobyAiICAgICAgIOKAoiBOZXR3b3JrICAgICA6IE5tYXAsIFdpcmVzaGFyaywgVHNoYXJrLCBOZXRjYXQsIFRDUER1bXAiCmVjaG8gIiAgICAgICDigKIgUGFzc3dvcmRzICAgOiBKb2huIFRoZSBSaXBwZXIsIFRIQyBIeWRyYSwgSGFzaGNhdCIKZWNobyAiICAgICAgIOKAoiBXZWIgJiBBcHBzICA6IFNRTE1hcCwgTmlrdG8sIERpcmIsIEdvYnVzdGVyLCBXZnV6eiIKZWNobyAiICAgICAgIOKAoiBXaXJlbGVzcyAgICA6IEFpcmNyYWNrLW5nIFN1aXRlIgplY2hvICIgICAgICAg4oCiIEZvcmVuc2ljcyAgIDogQmlud2FsaywgRm9yZW1vc3QsIFRlc3RkaXNrLCBTdGVnaGlkZSwgUmFkYXJlMiIKZWNobyAiPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSIKZXhlYyBiYXNoCg==" | base64 -d | sudo tee /usr/local/bin/kali_welcome.sh > /dev/null
+          sudo chmod +x /usr/local/bin/kali_welcome.sh
+
+          echo "W0Rlc2t0b3AgRW50cnldClR5cGU9QXBwbGljYXRpb24KTmFtZT1LYWxpIE9mZmVuc2l2ZSBTdWl0ZQpFeGVjPXhmY2U0LXRlcm1pbmFsIC0tdGl0bGU9IkthbGkgTGludXggU3VpdGUiIC0tZ2VvbWV0cnk9MTEweDMyIC1lIC91c3IvbG9jYWwvYmluL2thbGlfd2VsY29tZS5zaApIaWRkZW49ZmFsc2UKTm9EaXNwbGF5PWZhbHNlClgtR05PTUUtQXV0b3N0YXJ0LWVuYWJsZWQ9dHJ1ZQo=" | base64 -d | sudo tee /home/runner/.config/autostart/kali.desktop > /dev/null
+
+          sudo chown -R runner:runner /home/runner/Desktop /home/runner/.config /home/runner/.xsession 2>/dev/null || true
+          sudo systemctl restart xrdp-sesman || sudo service xrdp-sesman restart || true
+          sudo systemctl restart xrdp || sudo service xrdp restart || true
+          echo "TARGET_PORT=3389" >> $GITHUB_ENV
+
+      - name: Setup Native Ubuntu VPS SSH
+        if: "(startsWith(inputs.windows_version, 'ubuntu') || startsWith(inputs.windows_version, 'ubuntu2')) && !contains(inputs.windows_version, '-gui') && inputs.windows_version != 'android-cloud' && inputs.windows_version != 'ai-dev'"
+        run: |
+          echo "[+] Configuring Native Ubuntu host SSH..."
+          echo "root:Fazah@123" | sudo chpasswd
+          echo "runner:Fazah@123" | sudo chpasswd
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh || sudo service ssh restart
+          echo 'echo "========================================================="' >> /home/runner/.bashrc
+          echo 'echo " 🐧 Welcome to Ubuntu Linux VPS (Root Access)"' >> /home/runner/.bashrc
+          echo 'echo " [+] Physical Native Performance | 2Gbps Connection Ready"' >> /home/runner/.bashrc
+          echo 'echo "========================================================="' >> /home/runner/.bashrc
+          echo "TARGET_PORT=22" >> $GITHUB_ENV
+
+      - name: Install and Configure OpenCode AI with REA (Linux VPS & GUI)
+        continue-on-error: true
+        run: |
+          echo "[*] Setting up Integrated AI Environment (OpenCode + REA with Full Arabic Support)..."
+          sudo npm install -g opencode-ai @opencode/cli rea-agents --force || curl -fsSL https://opencode.ai/install | bash || true
+          sudo ln -sf $(which rea-agents 2>/dev/null || which rea 2>/dev/null) /usr/local/bin/rea 2>/dev/null || true
+          sudo ln -sf $(which opencode 2>/dev/null) /usr/local/bin/opencode 2>/dev/null || true
+          
+          # Install Arabic Fonts and Language Pack for Perfect Arabic Glyphs & Ligatures
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            fonts-noto-core fonts-arabeyes fonts-sil-scheherazade fonts-dejavu-core language-pack-ar 2>/dev/null || true
+          
+          # Configure Arabic Instructions & AGENTS.md for All Profiles
+          echo "IyDYqti52YTZitmF2KfYqiDYp9mE2YTYutipINin2YTYudix2KjZitipCi0g2KfZhNiq2K3Yr9irINmI2KfZhNmD2KrYp9io2Kkg2K/Yp9im2YXYpyDYqNin2YTZhNi62Kkg2KfZhNi52LHYqNmK2Kkg2KfZhNmB2LXYrdmJINin2YTYs9mE2YrZhdipINmI2KfZhNmF2KrYsdin2KjYt9ipINio2LTZg9mEINi32KjZiti52YouCi0g2KfZg9iq2Kgg2KfZhNmD2YTZhdin2Kog2K/Yp9im2YXYpyDZhdiq2LXZhNipINin2YTYrdix2YjZgSDZg9mD2KrZhNipINmI2KfYrdiv2Kkg2YXYq9mEINin2YTZg9iq2KfYqNipINmB2Yog2KfZhNmD2KrYqCDZiNin2YTZhdmI2KfZgti5INin2YTYsdiz2YXZitipICjZhdir2KfZhDog2YXYsdit2KjYp9mLINio2YPYjCDYo9mH2YTYp9mLINmI2LPZh9mE2KfZi9iMINmD2YrZgSDZitmF2YPZhtmG2Yog2YXYs9in2LnYr9iq2YPYnykuCi0g2YrZhdmG2Lkg2YXZhti52Kcg2KjYp9iq2Kcg2YjYtti5INmF2LPYp9mB2KfYqiDYqNmK2YYg2K3YsdmI2YEg2KfZhNmD2YTZhdipINin2YTZiNin2K3Yr9ipLgotINmK2YXZhti5INmF2YbYudinINio2KfYqtinINi52YPYsyDYp9iq2KzYp9mHINin2YTYrdix2YjZgSDYo9mIINin2YTZg9mE2YXYp9iqINil2LfZhNin2YLYpy4KLSDYrdin2YHYuCDYudmE2Ykg2KfZhNmD2YTZhdin2Kog2KfZhNil2YbYrNmE2YrYstmK2Kkg2YjYp9mE2KjYsdmF2KzZitipINmI2KPYs9mF2KfYoSDYp9mE2K/ZiNin2YQg2YPZhdinINmH2Yog2KjYp9mE2KXZhtis2YTZitiy2YrYqSDZhdi5INi02LHYrdmH2Kcg2KjYp9mE2LnYsdio2YrYqSDYp9mE2YXYqti12YTYqSDYp9mE2LPZhNmK2YXYqS4=" | base64 -d | sudo tee /tmp/arabic_rules.md > /dev/null
+          
+          # Setup OpenCode Config with REA MCP and Arabic Instructions for all user profiles
+          for p in /home/runner /root /etc/skel; do
+            sudo mkdir -p "$p/.config/opencode"
+            sudo cp /tmp/arabic_rules.md "$p/.config/opencode/arabic_rules.md"
+            sudo cp /tmp/arabic_rules.md "$p/AGENTS.md"
+            echo '{"$schema":"https://opencode.ai/config.json","instructions":["'"$p"'/.config/opencode/arabic_rules.md"],"mcp":{"rea":{"type":"local","command":["npx","-y","rea-agents","mcp"],"enabled":true}}}' | sudo tee "$p/.config/opencode/opencode.json" "$p/opencode.json" > /dev/null
+            sudo chown -R runner:runner "$p/.config" "$p/opencode.json" "$p/AGENTS.md" 2>/dev/null || true
+            
+            # Aliases, Environment & Arabic UTF-8 Banner
+            sudo touch "$p/.bashrc"
+            echo 'export LANG=en_US.UTF-8' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'export LC_ALL=en_US.UTF-8' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'export PYTHONIOENCODING=utf-8' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'alias rea="rea-agents"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'alias opencode="opencode"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo "======================================================================="' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo " 🤖 OpenCode AI Agent + REA MCP (Full Arabic Support Ready!)"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo " [*] OpenCode AI:         Type '''opencode''' (نظام برمجة وكتابة أكواد متصل)"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo " [*] REA Reverse Eng:     Type '''rea''' or '''rea-agents'''"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo " [*] Arabic Language:     مفعل بالكامل بدون تقطيع للأحرف"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo " [*] Official Arabic:     https://opencode.ai/ar"' | sudo tee -a "$p/.bashrc" > /dev/null
+            echo 'echo "======================================================================="' | sudo tee -a "$p/.bashrc" > /dev/null
+          done
+          
+          # GUI Desktop Shortcuts & Alt+Shift Arabic Toggle
+          if [[ "${{ inputs.windows_version }}" =~ -gui || "${{ inputs.windows_version }}" =~ -gui-ai || "${{ inputs.windows_version }}" == "android-cloud" || "${{ inputs.windows_version }}" == "ai-dev" ]]; then
+            sudo setxkbmap -layout us,ar -option grp:alt_shift_toggle 2>/dev/null || true
+            echo "setxkbmap -layout us,ar -option grp:alt_shift_toggle" | sudo tee -a /home/runner/.xsessionrc /home/runner/.bashrc > /dev/null
+            for dp in /home/runner/Desktop /root/Desktop /etc/skel/Desktop; do
+              sudo mkdir -p "$dp"
+              printf '[Desktop Entry]\nVersion=1.0\nType=Application\nName=OpenCode Web (Arabic)\nComment=OpenCode AI with Full Native Arabic RTL in Browser\nExec=sh -c "opencode web --port 4096 --hostname 127.0.0.1 & sleep 2 && x-www-browser http://127.0.0.1:4096"\nIcon=web-browser\nPath=/home/runner\nTerminal=false\nStartupNotify=true\n' | sudo tee "$dp/OpenCode-Web.desktop" > /dev/null
+              printf '[Desktop Entry]\nVersion=1.0\nType=Application\nName=OpenCode AI\nComment=AI Coding Assistant (https://opencode.ai)\nExec=xfce4-terminal -e "opencode"\nIcon=utilities-terminal\nPath=/home/runner\nTerminal=false\nStartupNotify=true\n' | sudo tee "$dp/OpenCode.desktop" > /dev/null
+              printf '[Desktop Entry]\nVersion=1.0\nType=Application\nName=REA Agent\nComment=Reverse Engineer Anything\nExec=xfce4-terminal -e "rea-agents"\nIcon=utilities-terminal\nPath=/home/runner\nTerminal=false\nStartupNotify=true\n' | sudo tee "$dp/REA-Agent.desktop" > /dev/null
+              printf '[Desktop Entry]\nVersion=1.0\nType=Link\nName=OpenCode Official (Web)\nComment=Visit OpenCode AI Website\nURL=https://opencode.ai/ar\nIcon=web-browser\n' | sudo tee "$dp/OpenCode-Official.desktop" > /dev/null
+              sudo chmod +x "$dp"/*.desktop 2>/dev/null || true
+              sudo chown -R runner:runner "$dp" 2>/dev/null || true
+            done
+          fi
+          echo "[+] Integrated AI Environment (OpenCode + REA with Full Arabic Support) Ready on Linux!" 
+
+      - name: Setup Containerized Distro VPS SSH
+        if: "!startsWith(inputs.windows_version, 'ubuntu') && !startsWith(inputs.windows_version, 'ubuntu2') && !endsWith(inputs.windows_version, '-gui') && !endsWith(inputs.windows_version, '-gui-ai') && inputs.windows_version != 'android-cloud' && inputs.windows_version != 'ai-dev'"
+        run: |
+          TARGET_OS="${{ inputs.windows_version }}"
+          echo "[+] Preparing Containerized VPS for: $TARGET_OS"
+          DOCKER_IMG="debian:12"
+          
+          if [[ "$TARGET_OS" =~ ^debian ]]; then
+            DOCKER_IMG="debian:12"
+            echo "IyEvYmluL3NoCkRFQklBTl9GUk9OVEVORD1ub25pbnRlcmFjdGl2ZSBhcHQtZ2V0IHVwZGF0ZQpERUJJQU5fRlJPTlRFTkQ9bm9uaW50ZXJhY3RpdmUgYXB0LWdldCBpbnN0YWxsIC15IC0tbm8taW5zdGFsbC1yZWNvbW1lbmRzIG9wZW5zc2gtc2VydmVyIHN1ZG8gY3VybCB3Z2V0IG5hbm8gYmFzaCBwcm9jcHMgcGFzc3dkCm1rZGlyIC1wIC92YXIvcnVuL3NzaGQgL2V0Yy9zc2gvc3NoZF9jb25maWcuZAplY2hvICdyb290OkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VyYWRkIC1tIC1zIC9iaW4vYmFzaCBydW5uZXIKZWNobyAncnVubmVyOkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VybW9kIC1hRyBzdWRvIHJ1bm5lcgplY2hvICdydW5uZXIgQUxMPShBTEwpIE5PUEFTU1dEOiBBTEwnID4+IC9ldGMvc3Vkb2VycwpzZWQgLWkgJ3NAc2Vzc2lvblxzKnJlcXVpcmVkXHMqcGFtX2xvZ2ludWlkLnNvQHNlc3Npb24gb3B0aW9uYWwgcGFtX2xvZ2ludWlkLnNvQGcnIC9ldGMvcGFtLmQvc3NoZCAyPi9kZXYvbnVsbCB8fCB0cnVlCmVjaG8gJ1Blcm1pdFJvb3RMb2dpbiB5ZXMnID4gL2V0Yy9zc2gvc3NoZF9jb25maWcuZC8wMS1hdXRoLmNvbmYKZWNobyAnUGFzc3dvcmRBdXRoZW50aWNhdGlvbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnLmQvMDEtYXV0aC5jb25mCmVjaG8gJ0tiZEludGVyYWN0aXZlQXV0aGVudGljYXRpb24geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kLzAxLWF1dGguY29uZgplY2hvICdQZXJtaXRSb290TG9naW4geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZwplY2hvICdQYXNzd29yZEF1dGhlbnRpY2F0aW9uIHllcycgPj4gL2V0Yy9zc2gvc3NoZF9jb25maWcKZWNobyAnPT09IFdlbGNvbWUgdG8gRGViaWFuIDEyIChCb29rd29ybSkgVlBTISA9PT0nID4+IC9ob21lL3J1bm5lci8uYmFzaHJjCmV4ZWMgL3Vzci9zYmluL3NzaGQgLUQ=" | base64 -d > /tmp/setup.sh
+          elif [[ "$TARGET_OS" =~ ^kali ]]; then
+            DOCKER_IMG="kalilinux/kali-rolling"
+            echo "IyEvYmluL3NoCkRFQklBTl9GUk9OVEVORD1ub25pbnRlcmFjdGl2ZSBhcHQtZ2V0IHVwZGF0ZQpERUJJQU5fRlJPTlRFTkQ9bm9uaW50ZXJhY3RpdmUgYXB0LWdldCBpbnN0YWxsIC15IC0tbm8taW5zdGFsbC1yZWNvbW1lbmRzIG9wZW5zc2gtc2VydmVyIHN1ZG8gY3VybCB3Z2V0IG5hbm8gYmFzaCBwcm9jcHMgcGFzc3dkIG5tYXAgbmV0Y2F0LXRyYWRpdGlvbmFsCm1rZGlyIC1wIC92YXIvcnVuL3NzaGQgL2V0Yy9zc2gvc3NoZF9jb25maWcuZAplY2hvICdyb290OkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VyYWRkIC1tIC1zIC9iaW4vYmFzaCBydW5uZXIKZWNobyAncnVubmVyOkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VybW9kIC1hRyBzdWRvIHJ1bm5lcgplY2hvICdydW5uZXIgQUxMPShBTEwpIE5PUEFTU1dEOiBBTEwnID4+IC9ldGMvc3Vkb2VycwpzZWQgLWkgJ3NAc2Vzc2lvblxzKnJlcXVpcmVkXHMqcGFtX2xvZ2ludWlkLnNvQHNlc3Npb24gb3B0aW9uYWwgcGFtX2xvZ2ludWlkLnNvQGcnIC9ldGMvcGFtLmQvc3NoZCAyPi9kZXYvbnVsbCB8fCB0cnVlCmVjaG8gJ1Blcm1pdFJvb3RMb2dpbiB5ZXMnID4gL2V0Yy9zc2gvc3NoZF9jb25maWcuZC8wMS1hdXRoLmNvbmYKZWNobyAnUGFzc3dvcmRBdXRoZW50aWNhdGlvbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnLmQvMDEtYXV0aC5jb25mCmVjaG8gJ0tiZEludGVyYWN0aXZlQXV0aGVudGljYXRpb24geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kLzAxLWF1dGguY29uZgplY2hvICdQZXJtaXRSb290TG9naW4geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZwplY2hvICdQYXNzd29yZEF1dGhlbnRpY2F0aW9uIHllcycgPj4gL2V0Yy9zc2gvc3NoZF9jb25maWcKZWNobyAnPT09IFdlbGNvbWUgdG8gS2FsaSBMaW51eCBQZW5ldHJhdGlvbiBUZXN0aW5nIFZQUyEgPT09JyA+PiAvaG9tZS9ydW5uZXIvLmJhc2hyYwpleGVjIC91c3Ivc2Jpbi9zc2hkIC1E" | base64 -d > /tmp/setup.sh
+          elif [[ "$TARGET_OS" =~ ^alpine ]]; then
+            DOCKER_IMG="alpine:latest"
+            echo "IyEvYmluL3NoCmFwayB1cGRhdGUKYXBrIGFkZCAtLW5vLWNhY2hlIG9wZW5zc2ggYmFzaCBzdWRvIGN1cmwgd2dldCBuYW5vIHByb2NwcyBzaGFkb3cKc3NoLWtleWdlbiAtQQpta2RpciAtcCAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kCmVjaG8gJ3Jvb3Q6RmF6YWhAMTIzJyB8IGNocGFzc3dkCmFkZHVzZXIgLUQgLXMgL2Jpbi9iYXNoIHJ1bm5lcgplY2hvICdydW5uZXI6RmF6YWhAMTIzJyB8IGNocGFzc3dkCmVjaG8gJ3J1bm5lciBBTEw9KEFMTCkgTk9QQVNTV0Q6IEFMTCcgPj4gL2V0Yy9zdWRvZXJzCmVjaG8gJ1Blcm1pdFJvb3RMb2dpbiB5ZXMnID4gL2V0Yy9zc2gvc3NoZF9jb25maWcuZC8wMS1hdXRoLmNvbmYKZWNobyAnUGFzc3dvcmRBdXRoZW50aWNhdGlvbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnLmQvMDEtYXV0aC5jb25mCmVjaG8gJ1Blcm1pdFJvb3RMb2dpbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnCmVjaG8gJ1Bhc3N3b3JkQXV0aGVudGljYXRpb24geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZwplY2hvICc9PT0gV2VsY29tZSB0byBBbHBpbmUgTGludXggTWluaW1hbCBWUFMhID09PScgPj4gL2hvbWUvcnVubmVyLy5iYXNocmMKZXhlYyAvdXNyL3NiaW4vc3NoZCAtRA==" | base64 -d > /tmp/setup.sh
+          elif [[ "$TARGET_OS" =~ ^arch ]]; then
+            DOCKER_IMG="archlinux:latest"
+            echo "IyEvYmluL3NoCnNlZCAtaSAncy9TaWdMZXZlbC4qPS4qUmVxdWlyZWQuKi9TaWdMZXZlbCA9IE5ldmVyLycgL2V0Yy9wYWNtYW4uY29uZgpwYWNtYW4gLVN5IC0tbm9jb25maXJtIG9wZW5zc2ggc3VkbyBjdXJsIHdnZXQgbmFubyBiYXNoIHByb2Nwcy1uZyBzaGFkb3cKc3NoLWtleWdlbiAtQQpta2RpciAtcCAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kCmVjaG8gJ3Jvb3Q6RmF6YWhAMTIzJyB8IGNocGFzc3dkCnVzZXJhZGQgLW0gLXMgL2Jpbi9iYXNoIHJ1bm5lcgplY2hvICdydW5uZXI6RmF6YWhAMTIzJyB8IGNocGFzc3dkCmVjaG8gJ3J1bm5lciBBTEw9KEFMTCkgTk9QQVNTV0Q6IEFMTCcgPj4gL2V0Yy9zdWRvZXJzCnNlZCAtaSAnc0BzZXNzaW9uXHMqcmVxdWlyZWRccypwYW1fbG9naW51aWQuc29Ac2Vzc2lvbiBvcHRpb25hbCBwYW1fbG9naW51aWQuc29AZycgL2V0Yy9wYW0uZC9zc2hkIDI+L2Rldi9udWxsIHx8IHRydWUKZWNobyAnUGVybWl0Um9vdExvZ2luIHllcycgPiAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kLzAxLWF1dGguY29uZgplY2hvICdQYXNzd29yZEF1dGhlbnRpY2F0aW9uIHllcycgPj4gL2V0Yy9zc2gvc3NoZF9jb25maWcuZC8wMS1hdXRoLmNvbmYKZWNobyAnUGVybWl0Um9vdExvZ2luIHllcycgPj4gL2V0Yy9zc2gvc3NoZF9jb25maWcKZWNobyAnUGFzc3dvcmRBdXRoZW50aWNhdGlvbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnCmVjaG8gJz09PSBXZWxjb21lIHRvIEFyY2ggTGludXggUm9sbGluZyBWUFMhID09PScgPj4gL2hvbWUvcnVubmVyLy5iYXNocmMKZXhlYyAvdXNyL3NiaW4vc3NoZCAtRA==" | base64 -d > /tmp/setup.sh
+          elif [[ "$TARGET_OS" =~ ^fedora ]]; then
+            DOCKER_IMG="fedora:40"
+            echo "IyEvYmluL3NoCmRuZiBpbnN0YWxsIC15IC0tc2V0b3B0PWluc3RhbGxfd2Vha19kZXBzPUZhbHNlIC0tbm9kb2NzIG9wZW5zc2gtc2VydmVyIHBhc3N3ZCBzdWRvIGN1cmwgd2dldCBuYW5vIGJhc2ggcHJvY3BzLW5nCnNzaC1rZXlnZW4gLUEKbWtkaXIgLXAgL2V0Yy9zc2gvc3NoZF9jb25maWcuZAplY2hvICdyb290OkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VyYWRkIC1tIC1zIC9iaW4vYmFzaCBydW5uZXIKZWNobyAncnVubmVyOkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VybW9kIC1hRyB3aGVlbCBydW5uZXIKZWNobyAnJXdoZWVsIEFMTD0oQUxMKSBOT1BBU1NXRDogQUxMJyA+PiAvZXRjL3N1ZG9lcnMKc2VkIC1pICdzQHNlc3Npb25ccypyZXF1aXJlZFxzKnBhbV9sb2dpbnVpZC5zb0BzZXNzaW9uIG9wdGlvbmFsIHBhbV9sb2dpbnVpZC5zb0BnJyAvZXRjL3BhbS5kL3NzaGQgMj4vZGV2L251bGwgfHwgdHJ1ZQpjaG1vZCAwNjQwIC9ldGMvc2hhZG93IDI+L2Rldi9udWxsIHx8IHRydWUKZWNobyAnUGVybWl0Um9vdExvZ2luIHllcycgPiAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kLzAxLWF1dGguY29uZgplY2hvICdQYXNzd29yZEF1dGhlbnRpY2F0aW9uIHllcycgPj4gL2V0Yy9zc2gvc3NoZF9jb25maWcuZC8wMS1hdXRoLmNvbmYKZWNobyAnS2JkSW50ZXJhY3RpdmVBdXRoZW50aWNhdGlvbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnLmQvMDEtYXV0aC5jb25mCmVjaG8gJ1Blcm1pdFJvb3RMb2dpbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnCmVjaG8gJ1Bhc3N3b3JkQXV0aGVudGljYXRpb24geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZwplY2hvICc9PT0gV2VsY29tZSB0byBGZWRvcmEgNDAgRW50ZXJwcmlzZSBWUFMhID09PScgPj4gL2hvbWUvcnVubmVyLy5iYXNocmMKZXhlYyAvdXNyL3NiaW4vc3NoZCAtRA==" | base64 -d > /tmp/setup.sh
+          elif [[ "$TARGET_OS" =~ ^rocky ]]; then
+            DOCKER_IMG="rockylinux:9"
+            echo "IyEvYmluL3NoCmRuZiBpbnN0YWxsIC15IC0tc2V0b3B0PWluc3RhbGxfd2Vha19kZXBzPUZhbHNlIC0tbm9kb2NzIG9wZW5zc2gtc2VydmVyIHBhc3N3ZCBzdWRvIGN1cmwgd2dldCBuYW5vIGJhc2ggcHJvY3BzLW5nCnNzaC1rZXlnZW4gLUEKbWtkaXIgLXAgL2V0Yy9zc2gvc3NoZF9jb25maWcuZAplY2hvICdyb290OkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VyYWRkIC1tIC1zIC9iaW4vYmFzaCBydW5uZXIKZWNobyAncnVubmVyOkZhemFoQDEyMycgfCBjaHBhc3N3ZAp1c2VybW9kIC1hRyB3aGVlbCBydW5uZXIKZWNobyAnJXdoZWVsIEFMTD0oQUxMKSBOT1BBU1NXRDogQUxMJyA+PiAvZXRjL3N1ZG9lcnMKc2VkIC1pICdzQHNlc3Npb25ccypyZXF1aXJlZFxzKnBhbV9sb2dpbnVpZC5zb0BzZXNzaW9uIG9wdGlvbmFsIHBhbV9sb2dpbnVpZC5zb0BnJyAvZXRjL3BhbS5kL3NzaGQgMj4vZGV2L251bGwgfHwgdHJ1ZQpjaG1vZCAwNjQwIC9ldGMvc2hhZG93IDI+L2Rldi9udWxsIHx8IHRydWUKZWNobyAnUGVybWl0Um9vdExvZ2luIHllcycgPiAvZXRjL3NzaC9zc2hkX2NvbmZpZy5kLzAxLWF1dGguY29uZgplY2hvICdQYXNzd29yZEF1dGhlbnRpY2F0aW9uIHllcycgPj4gL2V0Yy9zc2gvc3NoZF9jb25maWcuZC8wMS1hdXRoLmNvbmYKZWNobyAnS2JkSW50ZXJhY3RpdmVBdXRoZW50aWNhdGlvbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnLmQvMDEtYXV0aC5jb25mCmVjaG8gJ1Blcm1pdFJvb3RMb2dpbiB5ZXMnID4+IC9ldGMvc3NoL3NzaGRfY29uZmlnCmVjaG8gJ1Bhc3N3b3JkQXV0aGVudGljYXRpb24geWVzJyA+PiAvZXRjL3NzaC9zc2hkX2NvbmZpZwplY2hvICc9PT0gV2VsY29tZSB0byBSb2NreSBMaW51eCA5IChSSEVMKSBWUFMhID09PScgPj4gL2hvbWUvcnVubmVyLy5iYXNocmMKZXhlYyAvdXNyL3NiaW4vc3NoZCAtRA==" | base64 -d > /tmp/setup.sh
+          fi
+
+          chmod +x /tmp/setup.sh
+          echo "[*] Pulling and launching $DOCKER_IMG container on host port 2222..."
+          docker run -d --name vps --privileged -p 2222:22 -v /tmp/setup.sh:/setup.sh "$DOCKER_IMG" sh /setup.sh
+          echo "TARGET_PORT=2222" >> $GITHUB_ENV
+
+      - name: Wait for Service Port to be Live
+        run: |
+          port="${{ env.TARGET_PORT }}"
+          if [ -z "$port" ]; then port=22; fi
+          echo "[*] Waiting for service on port $port (up to 90 seconds)..."
+          for i in $(seq 1 90); do
+            if nc -z 127.0.0.1 $port 2>/dev/null || (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+              echo "[+] Service is LIVE on port $port! (Ready in ${i}s)"
+              break
+            fi
+            if [ "$i" -eq 30 ] || [ "$i" -eq 60 ]; then
+              echo "[*] Still starting (${i}s)... Recent container logs:"
+              docker logs vps --tail 5 2>/dev/null || true
+            fi
+            sleep 1
+          done
+
+      - name: Configure and Start Ngrok Tunnel
+        id: ngrok-tunnel
+        run: |
+          reg="${{ inputs.ngrok_region }}"
+          if [ -z "$reg" ] || [ "$reg" = "gb" ]; then reg="eu"; fi
+          port="${{ env.TARGET_PORT }}"
+          if [ -z "$port" ]; then port=22; fi
+          echo "[*] Starting Ngrok TCP tunnel for port $port on region $reg..."
+          nohup ngrok tcp "$port" --region "$reg" --log=stdout > /tmp/ngrok.log 2>&1 & disown
+          sleep 3
+          tunnel_url=""
+          for i in $(seq 1 25); do
+            tunnel_url=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*' | head -n1 | sed 's|tcp://||')
+            if [ -n "$tunnel_url" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ -n "$tunnel_url" ]; then
+            echo "tunnel_url=$tunnel_url" >> $GITHUB_OUTPUT
+            echo "[+] Tunnel URL: $tunnel_url"
+          else
+            echo "[!] Failed to get tunnel URL"
+            cat /tmp/ngrok.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Build Connection Artifact
+        run: |
+          url="${{ steps.ngrok-tunnel.outputs.tunnel_url }}"
+          port="${{ env.TARGET_PORT }}"
+          user_name="runner"
+          if [[ "${{ inputs.windows_version }}" =~ ^win ]]; then user_name="Fazah"; fi
+          
+          echo "full address:s:$url" > rdp-connection.rdp
+          echo "username:s:$user_name" >> rdp-connection.rdp
+          echo "prompt for credentials:i:1" >> rdp-connection.rdp
+          echo "administrative session:i:1" >> rdp-connection.rdp
+          echo "authentication level:i:0" >> rdp-connection.rdp
+          echo "enablecredsspsupport:i:0" >> rdp-connection.rdp
+          echo "autoreconnection enabled:i:1" >> rdp-connection.rdp
+          echo "smart sizing:i:1" >> rdp-connection.rdp
+          echo "screen mode id:i:2" >> rdp-connection.rdp
+          echo "desktopwidth:i:1920" >> rdp-connection.rdp
+          echo "desktopheight:i:1080" >> rdp-connection.rdp
+          echo "redirectclipboard:i:1" >> rdp-connection.rdp
+          echo "$url" >> rdp-connection.rdp
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection
+          path: rdp-connection.rdp
+          retention-days: 1
+
+      - name: Keep Alive Session
+        run: |
+          echo "[+] Server session is live (${{ steps.ngrok-tunnel.outputs.tunnel_url }})! Keeping session active..."
+          reg="${{ inputs.ngrok_region }}"
+          if [ -z "$reg" ] || [ "$reg" = "gb" ]; then reg="eu"; fi
+          port="${{ env.TARGET_PORT }}"
+          if [ -z "$port" ]; then port=22; fi
+          while true; do
+            if ! pgrep -x "ngrok" > /dev/null; then
+              echo "[!] Ngrok stopped. Restarting tunnel..."
+              nohup ngrok tcp "$port" --region "$reg" --log=stdout > /tmp/ngrok.log 2>&1 & disown
+            fi
+            sleep 60
+          done
